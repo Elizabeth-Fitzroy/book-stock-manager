@@ -1,53 +1,43 @@
 # モジュール2: 背表紙・画像解析仕様書 (Shelf Analyzer)
 
 ## 1. 概要
-スマホのカメラ撮影画像や写真ファイルを入力とし、マルチモーダルAI（Gemini API等）を用いて
-並んでいる背表紙の「作品タイトル」「巻数」「著者名」を解析・抽出し、構造化データとして返却するモジュール。
+スマホのカメラ撮影画像や写真ファイルを入力とし、マルチモーダルAI（Google Gemini API）を用いて
+並んでいる背表紙の「作品タイトル」「巻数」「判型（コミックス vs 文庫）」を解析・抽出し、構造化データとして返却するモジュール。
 
 ## 2. 責務 (Responsibilities)
-- 画像の受け取り（カメラ撮影のBlob、ファイルアップロードのBase64）
-- 通信軽量化のための適切なリサイズ・圧縮（最大長1600px等）
-- Vision AIプロンプトの実行（背表紙認識に最適化した日本語抽出プロンプト）
-- 認識結果のJSONパースとフォーマット正規化（漢数字「一・二」や「上・下」の巻数扱い）
-- エラーハンドリング（不鮮明な画像、文字認識不可時のフォールバック）
+- **画像の最適リサイズと圧縮**:
+  - Xperia 10 II の端末負荷と送信レイテンシーを最小化するため、長辺2048px/JPEG 85%に最適リサイズ。
+- **マルチAIモデル対応と動的切り替え**:
+  - **`gemini-3.5-flash-lite`（最速・標準推奨）**: 深読み（Thinking）を排し、見たままの文字を素早く返す最速モデル。
+  - **`gemini-3.8-flash`**: 安定した文字認識と相場推論を行う後継標準モデル。
+  - **`gemini-4-hydrogen`**: エージェント特化の最新高速モデル。
+  - 11/19にサービス終了する `gemini-3.6-flash` を完全排除。
+- **🔄 有効なGeminiモデル一覧の手動更新**:
+  - 起動時の無駄な通信を排除し、ユーザーが手動更新を押した時のみ `GET /v1beta/models` を呼び出す。
+  - **厳格な除外フィルター**: 音声合成（`tts`）、文字起こし（`transcribe`）、画像生成（`image/banana`）、ロボティクス等の非対象モデルを完全に除外。
+- **アンチハルシネーション厳格プロンプト**:
+  - 勝手な連番推測・存在しない巻の捏造補完を厳格に禁止。
+  - 同一巻・重複巻を並んでいる数だけ忠実に出力。
+  - 著者別作品（例: 『獣の奏者』と『鹿の王』等）の混同を防止。
 
-## 3. インターフェース定義 (API)
+## 3. インターフェース定義 (Kotlin)
 
-```typescript
-export interface RecognizedSpine {
-  title: string;              // 作品名・書名（例: "不毛地帯", "天は赤い河のほとり"）
-  volume: number | string;    // 巻数（例: 1, 2, "上", "下", "IV"）
-  author?: string;            // 著者名（例: "山崎豊子", "篠原千絵"）
-  rawSpineText?: string;      // 背表紙から読めた文字（検証用）
-  confidence?: number;        // 信頼度
-}
+```kotlin
+data class ScannedSpine(
+    val title: String,
+    val volume: String,
+    val author: String? = null,
+    val format: String? = null // "コミックス" または "文庫"
+)
 
-export interface VisionAnalysisResult {
-  success: boolean;
-  books: RecognizedSpine[];
-  processingTimeMs: number;
-  errorMessage?: string;
-}
+class ShelfAnalyzer(
+    var apiKey: String = "",
+    var modelName: String = "gemini-3.5-flash-lite"
+) {
+    /** ビットマップ画像から背表紙を認識 */
+    suspend fun analyzeShelfBitmap(bitmap: Bitmap): Result<List<ScannedSpine>>
 
-export interface ShelfAnalyzer {
-  /** 画像（BlobまたはBase64データURL）を解析する */
-  analyzeImage(imageData: Blob | string): Promise<VisionAnalysisResult>;
-
-  /** 使用するAIバックエンド/モデルの切り替え */
-  setModel(modelName: string): void;
+    /** Google APIから有効なVision対応Geminiモデルのみを手動取得 */
+    suspend fun fetchAvailableVisionModels(key: String): Result<List<Pair<String, String>>>
 }
 ```
-
-## 4. プロンプト仕様（抜粋）
-```text
-あなたは古本・ブックオフのプロの仕入れリサーチャーです。
-画像に写っている本（背表紙）を、左から順に特定してください。
-各本について、以下をJSON配列で出力してください:
-- title: 作品タイトル（シリーズ全体の名前。巻数やサブタイトルは除く）
-- volume: 巻数（数字、または"上"、"下"、ローマ数字など）
-- author: 著者名（判別できる場合）
-```
-
-## 5. 差し替え・拡張ポイント
-- **モデルの切り替え**: Gemini 2.0 Flash、Gemini 1.5 Pro、ローカルLLM（LM Studio / Ollama等）への切り替えが可能。
-- **端末内OCRとのハイブリッド**: OCRライブラリ（Tesseract.js等）で一次抽出したあとLLMで整形するパイプラインへの差し替えが可能。

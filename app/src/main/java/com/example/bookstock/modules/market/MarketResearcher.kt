@@ -2,67 +2,66 @@ package com.example.bookstock.modules.market
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import org.json.JSONObject
 import java.net.URLEncoder
-import java.util.concurrent.TimeUnit
 
 /**
- * モジュール4: 相場・外部リサーチモジュール (Kotlin版・ダイレクト相場表示対応)
+ * モジュール4: 相場・外部リサーチモジュール (Kotlin版・Gemini推論連携＆直接通信完全撤廃)
  * 仕様書: docs/04_market_researcher.md
  */
 
 data class DirectMarketPrice(
     val title: String,
-    val mercariSoldPrice: Int?,      // メルカリ直近売切相場 (円)
-    val amazonLowestPrice: Int?,    // Amazon中古最安値 (円)
+    val mercariSoldPrice: Int?,      // メルカリ直近売切相場 (Gemini推論値・円)
+    val amazonLowestPrice: Int?,    // Amazon中古最安値 (Gemini推論値・円)
     val estimatedProfit: Int?,      // 見込み純利益 (円)
     val profitMarginPercent: Float?,// 粗利率 (%)
-    val mercariDetailUrl: String,   // 精査用メルカリURL
-    val amazonDetailUrl: String     // 精査用AmazonURL
+    val mercariDetailUrl: String,   // タップで開くメルカリ検索URL
+    val amazonDetailUrl: String     // タップで開くAmazon検索URL
 )
 
 class MarketResearcher(
     private val defaultShippingCost: Int = 750, // 宅急便60サイズ想定
     private val defaultCostPerBook: Int = 110   // 110円棚想定
 ) {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .build()
-
     /**
-     * 作品名からダイレクト相場を自動取得し、純利益を計算する
+     * Geminiの推論値または推定巻数から純利益を安全に計算する
+     * ※ メルカリやAmazonへの危険な直接スクレイピング・独自通信は行いません
      */
-    suspend fun fetchDirectMarketPrice(
+    suspend fun estimateMarketPrice(
         title: String,
         storeBuyCount: Int = 0,
-        isCompleteSet: Boolean = true
-    ): DirectMarketPrice = withContext(Dispatchers.IO) {
-        val keyword = if (isCompleteSet) "$title 全巻" else title
+        totalVolumes: Int = 1,
+        isCompleteSet: Boolean = true,
+        aiPredictedPrice: Int? = null
+    ): DirectMarketPrice = withContext(Dispatchers.Default) {
+        val keyword = if (isCompleteSet) "$title 全巻" else "$title $totalVolumes"
         val encodedKeyword = URLEncoder.encode(keyword, "UTF-8")
 
         val mercariUrl = "https://jp.mercari.com/search?keyword=$encodedKeyword&status=sold_out&sort=created_time&order=desc"
         val amazonUrl = "https://www.amazon.co.jp/s?k=$encodedKeyword&i=stripbooks"
 
-        // メルカリ直近売切相場（非同期スクレイピング・APIフェッチ）
-        val mercariPrice = fetchMercariRecentSoldPrice(keyword)
+        // Geminiの推論値がある場合はそれを採用、ない場合は冊数ベースの安全な相場推計 (1冊あたり平均250〜350円)
+        val mercariPrice = aiPredictedPrice ?: run {
+            if (totalVolumes > 0) {
+                // 概算推論: 巻数 x 300円 (完結セット加算)
+                val base = totalVolumes * 300
+                if (isCompleteSet) (base * 1.2).toInt() else base
+            } else {
+                null
+            }
+        }
 
-        // Amazon最安価格（概算推論またはAPIフェッチ）
-        val amazonPrice = mercariPrice?.let { (it * 1.15).toInt() } // メルカリ相場に準拠した推定またはフェッチ値
+        val amazonPrice = mercariPrice?.let { (it * 1.15).toInt() }
 
-        // 粗利益の自動計算 (売価 - 仕入原価 - 手数料10% - 送料)
-        val baseSalePrice = mercariPrice ?: amazonPrice
         var netProfit: Int? = null
         var margin: Float? = null
 
-        if (baseSalePrice != null && baseSalePrice > 0) {
+        if (mercariPrice != null && mercariPrice > 0) {
             val purchaseCost = storeBuyCount * defaultCostPerBook
-            val fee = (baseSalePrice * 0.10f).toInt()
-            val profit = baseSalePrice - purchaseCost - defaultShippingCost - fee
+            val fee = (mercariPrice * 0.10f).toInt()
+            val profit = mercariPrice - purchaseCost - defaultShippingCost - fee
             netProfit = profit
-            margin = (profit.toFloat() / baseSalePrice.toFloat()) * 100f
+            margin = (profit.toFloat() / mercariPrice.toFloat()) * 100f
         }
 
         DirectMarketPrice(
@@ -74,38 +73,5 @@ class MarketResearcher(
             mercariDetailUrl = mercariUrl,
             amazonDetailUrl = amazonUrl
         )
-    }
-
-    /**
-     * メルカリの直近成約価格を抽出
-     */
-    private fun fetchMercariRecentSoldPrice(keyword: String): Int? {
-        try {
-            val encoded = URLEncoder.encode(keyword, "UTF-8")
-            val url = "https://api.mercari.jp/items/search?keyword=$encoded&status=sold_out&sort=created_time&order=desc"
-            val request = Request.Builder()
-                .url(url)
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14)")
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return null
-                val bodyStr = response.body?.string() ?: return null
-                val json = JSONObject(bodyStr)
-                val items = json.optJSONArray("data") ?: return null
-                
-                val prices = mutableListOf<Int>()
-                for (i in 0 until minOf(5, items.length())) {
-                    val p = items.optJSONObject(i)?.optInt("price") ?: 0
-                    if (p > 500) prices.add(p)
-                }
-                if (prices.isNotEmpty()) {
-                    return prices.average().toInt()
-                }
-            }
-        } catch (_: Exception) {
-            // 通信制限等のフォールバック
-        }
-        return null
     }
 }
