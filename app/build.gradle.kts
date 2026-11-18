@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.bookstock"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -56,6 +56,9 @@ dependencies {
     // ネットワーク・非同期処理
     implementation(libs.okhttp)
     implementation(libs.kotlinx.coroutines.android)
+
+    // Google認証 (Play Services Auth)
+    implementation(libs.play.services.auth)
 
     // カメラ (CameraX)
     implementation(libs.androidx.camera.core)

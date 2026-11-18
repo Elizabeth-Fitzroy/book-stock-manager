@@ -1,6 +1,7 @@
 package com.example.bookstock
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -18,6 +19,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -34,6 +36,8 @@ import com.example.bookstock.modules.market.DirectMarketPrice
 import com.example.bookstock.modules.market.MarketResearcher
 import com.example.bookstock.modules.matcher.MatchedSeriesStatus
 import com.example.bookstock.modules.matcher.SetMatcher
+import com.example.bookstock.modules.stock.GoogleAuthHelper
+import com.example.bookstock.modules.stock.TokenResult
 import com.example.bookstock.modules.stock.StockItem
 import com.example.bookstock.modules.stock.StockProvider
 import com.example.bookstock.modules.vision.ShelfAnalyzer
@@ -50,7 +54,8 @@ class MainActivity : ComponentActivity() {
 
         val prefs = getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
         shelfAnalyzer.apiKey = prefs.getString("gemini_api_key", "") ?: ""
-        shelfAnalyzer.modelName = prefs.getString("gemini_model_name", "gemini-3.8-flash") ?: "gemini-3.8-flash"
+        shelfAnalyzer.modelName = prefs.getString("gemini_model_name", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite"
+        shelfAnalyzer.enableDecisionPrecheck = prefs.getBoolean("use_gemini_decision", true)
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
@@ -63,12 +68,14 @@ class MainActivity : ComponentActivity() {
                         shelfAnalyzer = shelfAnalyzer,
                         setMatcher = setMatcher,
                         marketResearcher = marketResearcher,
-                        onSaveConfig = { key, model ->
+                        onSaveConfig = { key, model, useDecision ->
                             shelfAnalyzer.apiKey = key
                             shelfAnalyzer.modelName = model
+                            shelfAnalyzer.enableDecisionPrecheck = useDecision
                             prefs.edit()
                                 .putString("gemini_api_key", key)
                                 .putString("gemini_model_name", model)
+                                .putBoolean("use_gemini_decision", useDecision)
                                 .apply()
                         }
                     )
@@ -90,10 +97,12 @@ fun MainScreen(
     shelfAnalyzer: ShelfAnalyzer,
     setMatcher: SetMatcher,
     marketResearcher: MarketResearcher,
-    onSaveConfig: (String, String) -> Unit
+    onSaveConfig: (String, String, Boolean) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val googleAuthHelper = remember { GoogleAuthHelper(context) }
+    var currentAccount by remember { mutableStateOf(googleAuthHelper.getSavedAccountName()) }
 
     var selectedTab by remember { mutableStateOf(0) }
     var isLoading by remember { mutableStateOf(false) }
@@ -106,42 +115,135 @@ fun MainScreen(
     var searchResults by remember { mutableStateOf<List<StockItem>>(emptyList()) }
     var stockCount by remember { mutableStateOf(0) }
 
-    // スプレッドシート自動同期
-    LaunchedEffect(Unit) {
-        isLoading = true
-        loadingMessage = "スプレッドシート(Stock_Summary)を同期中..."
-        val res = stockProvider.syncFromSheet()
-        isLoading = false
-        if (res.isSuccess) {
-            stockCount = res.getOrDefault(0)
-            searchResults = stockProvider.searchByKeyword("")
-            Toast.makeText(context, "在庫 ${stockCount}件 同期完了！", Toast.LENGTH_SHORT).show()
+    // Google 権限同意画面（初回認証）ランチャー
+    var pendingConsentIntent by remember { mutableStateOf<Intent?>(null) }
+    val consentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            Log.d("BookStock", "ユーザーによるSheetsアクセス同意を確認しました")
+            Toast.makeText(context, "Google権限が付与されました。同期中...", Toast.LENGTH_SHORT).show()
+            // 同意完了後に同期を再実行
+            scope.launch {
+                isLoading = true
+                loadingMessage = "Google Sheets API (v4) からデータ取得中..."
+                val tokenRes = googleAuthHelper.fetchToken(currentAccount)
+                if (tokenRes is TokenResult.Success) {
+                    val res = stockProvider.syncFromSheet(tokenRes.token)
+                    isLoading = false
+                    if (res.isSuccess) {
+                        stockCount = res.getOrDefault(0)
+                        searchResults = stockProvider.searchByKeyword("")
+                        val stats = stockProvider.lastSyncStats
+                        val toastMsg = "同期完了: ${stockCount}種 (実在庫${stats.totalPhysicalBooks}冊 / Sold${stats.soldExcluded}冊除外) [Sheets API]"
+                        Toast.makeText(context, toastMsg, Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(context, "同期エラー: ${res.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                    }
+                } else {
+                    isLoading = false
+                    Toast.makeText(context, "トークン再取得失敗", Toast.LENGTH_LONG).show()
+                }
+            }
         } else {
-            val err = res.exceptionOrNull()?.message ?: "不明なエラー"
-            Log.e("BookStock", "初期同期失敗: $err")
-            Toast.makeText(context, "同期エラー: $err", Toast.LENGTH_LONG).show()
+            Log.w("BookStock", "権限同意がキャンセルまたは失敗しました: resultCode=${result.resultCode}")
+            Toast.makeText(context, "Google権限の許可がキャンセルされました", Toast.LENGTH_LONG).show()
         }
     }
 
-    // カメラ撮影後の解析処理
+    // スプレッドシート同期用関数
+    val syncStockData: () -> Unit = {
+        scope.launch {
+            isLoading = true
+            loadingMessage = if (currentAccount != null) {
+                "Googleアカウント認証中 (${currentAccount})..."
+            } else {
+                "スプレッドシート(Ledger)を同期中..."
+            }
+
+            var token: String? = null
+            if (currentAccount != null) {
+                when (val tokenRes = googleAuthHelper.fetchToken(currentAccount)) {
+                    is TokenResult.Success -> {
+                        token = tokenRes.token
+                        loadingMessage = "Google Sheets API (v4) から非公開データを取得中..."
+                    }
+                    is TokenResult.NeedConsent -> {
+                        isLoading = false
+                        Log.d("BookStock", "初回同意画面を起動します")
+                        consentLauncher.launch(tokenRes.intent)
+                        return@launch
+                    }
+                    is TokenResult.Error -> {
+                        Log.e("BookStock", "トークン取得エラー: ${tokenRes.message}")
+                        loadingMessage = "トークン取得失敗。公開URLから試行中..."
+                    }
+                }
+            }
+
+            val res = stockProvider.syncFromSheet(token)
+            isLoading = false
+            if (res.isSuccess) {
+                stockCount = res.getOrDefault(0)
+                searchResults = stockProvider.searchByKeyword("")
+                val stats = stockProvider.lastSyncStats
+                val methodDesc = if (token != null) "Sheets API" else "公開CSV"
+                val toastMsg = "同期完了: ${stockCount}種 (実在庫${stats.totalPhysicalBooks}冊 / Sold${stats.soldExcluded}冊除外) [$methodDesc]"
+                Toast.makeText(context, toastMsg, Toast.LENGTH_LONG).show()
+            } else {
+                val err = res.exceptionOrNull()?.message ?: "不明なエラー"
+                Log.e("BookStock", "同期失敗: $err")
+                Toast.makeText(context, "同期エラー: $err", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    // Google アカウント選択ランチャー
+    val accountPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            val accountName = result.data?.getStringExtra(android.accounts.AccountManager.KEY_ACCOUNT_NAME)
+            if (!accountName.isNullOrEmpty()) {
+                googleAuthHelper.saveAccountName(accountName)
+                currentAccount = accountName
+                Toast.makeText(context, "連携アカウント: $accountName", Toast.LENGTH_SHORT).show()
+                syncStockData()
+            }
+        }
+    }
+
+    // 初回自動同期（保存済みアカウントがある場合は認証トークン付きで取得）
+    LaunchedEffect(Unit) {
+        syncStockData()
+    }
+
+    // カメラ撮影後の解析処理（Decision-1 前処理 ＋ Flash 背表紙解析）
     val processBitmap: (Bitmap) -> Unit = { bitmap ->
         scope.launch {
             isLoading = true
-            loadingMessage = "AIが背表紙を解析中..."
-            Log.d("BookStock", "画像解析開始: 幅=${bitmap.width}, 高さ=${bitmap.height}")
-            val visionRes = shelfAnalyzer.analyzeShelfBitmap(bitmap)
+            loadingMessage = if (shelfAnalyzer.enableDecisionPrecheck) {
+                "Gemini Decision-1 高速判定 ＆ 背表紙解析中..."
+            } else {
+                "AIが背表紙を解析中..."
+            }
+            Log.d("BookStock", "画像解析開始: 幅=${bitmap.width}, 高さ=${bitmap.height}, Decision前処理=${shelfAnalyzer.enableDecisionPrecheck}")
+            val visionRes = shelfAnalyzer.analyzeShelf(bitmap)
             if (visionRes.isSuccess) {
-                val scannedBooks = visionRes.getOrDefault(emptyList())
-                Log.d("BookStock", "背表紙認識成功: ${scannedBooks.size} 冊検出")
+                val output = visionRes.getOrNull()
+                val scannedBooks = output?.spines ?: emptyList()
+                val decision = output?.decision
+
+                Log.d("BookStock", "背表紙認識成功: ${scannedBooks.size} 冊検出, Decision=$decision")
                 loadingMessage = "在庫突合＆ダイレクト相場を取得中..."
-                val matches = setMatcher.match(scannedBooks, stockProvider)
+                val matches = setMatcher.match(scannedBooks, stockProvider, decision)
 
                 val cards = matches.map { match ->
                     val marketPrice = try {
                         marketResearcher.fetchDirectMarketPrice(
                             title = match.title,
                             storeBuyCount = match.storeVolumes.size,
-                            isCompleteSet = match.canCompleteByStore || match.canCompleteByMerged
+                            isCompleteSet = match.canCompleteByStore || match.canCompleteByMerged || match.canCompleteByB || match.canCompleteByBS
                         )
                     } catch (e: Exception) {
                         Log.e("BookStock", "相場取得エラー(${match.title}): ${e.message}")
@@ -169,7 +271,7 @@ fun MainScreen(
         }
     }
 
-    // カメラ権限ランチャー（権限がなければ許可ダイアログを自動表示）
+    // カメラ権限ランチャー
     val cameraPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
         if (isGranted) {
             Log.d("BookStock", "カメラ権限が付与されました。カメラを起動します。")
@@ -200,7 +302,7 @@ fun MainScreen(
                 title = {
                     Column {
                         Text("Book Stock Manager", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = Color.White)
-                        Text("在庫: ${stockCount}件 (Stock_Summary)", fontSize = 11.sp, color = Color(0xFF94A3B8))
+                        Text("在庫: ${stockCount}件 (Ledger)", fontSize = 11.sp, color = Color(0xFF94A3B8))
                     }
                 },
                 actions = {
@@ -262,7 +364,6 @@ fun MainScreen(
                         ) {
                             Button(
                                 onClick = {
-                                    // カメラ権限チェック
                                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                                         cameraLauncher.launch(null)
                                     } else {
@@ -293,7 +394,7 @@ fun MainScreen(
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
-                                    "ブックオフの棚を撮影すると、\n作品名・全巻数・店頭巻・自宅在庫・\nダイレクト相場と見込み利益が一瞬で出ます！",
+                                    "ブックオフの棚を撮影すると、\n作品名・全巻数・店頭巻・自宅在庫・\n帯付き(B/BS)判定・見込み利益が一瞬で出ます！\n(Gemini Decision-1 高速ガードレール対応)",
                                     color = Color(0xFF94A3B8),
                                     fontSize = 13.sp,
                                     lineHeight = 20.sp
@@ -373,6 +474,8 @@ fun MainScreen(
     if (showSettingsDialog) {
         var tempKey by remember { mutableStateOf(shelfAnalyzer.apiKey) }
         var tempModel by remember { mutableStateOf(shelfAnalyzer.modelName) }
+        var tempUseDecision by remember { mutableStateOf(shelfAnalyzer.enableDecisionPrecheck) }
+
         AlertDialog(
             onDismissRequest = { showSettingsDialog = false },
             title = { Text("アプリ設定") },
@@ -386,19 +489,76 @@ fun MainScreen(
                         singleLine = true
                     )
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("AIモデル名:", fontSize = 12.sp)
+                    Text("AIモデル名 (背表紙認識):", fontSize = 12.sp)
                     OutlinedTextField(
                         value = tempModel,
                         onValueChange = { tempModel = it },
                         modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("gemini-3.8-flash") },
+                        placeholder = { Text("gemini-3.5-flash-lite") },
                         singleLine = true
                     )
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = tempUseDecision,
+                            onCheckedChange = { tempUseDecision = it }
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Column {
+                            Text("Gemini Decision-1 高速前処理", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            Text("約0.15秒・トークン無料。全巻数・完結判定・刊行形態を事前確定し誤認識を防ぎます", fontSize = 11.sp, color = Color(0xFF94A3B8))
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    HorizontalDivider(color = Color(0xFF334155))
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Text("Googleアカウント連携 (非公開シート同期):", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    if (currentAccount != null) {
+                        Text("連携中: $currentAccount", fontSize = 12.sp, color = Color(0xFF34D399))
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = { syncStockData() },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("今すぐ再同期", fontSize = 12.sp)
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    googleAuthHelper.signOut()
+                                    currentAccount = null
+                                    Toast.makeText(context, "Google連携を解除しました", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("解除", fontSize = 12.sp, color = Color(0xFFF87171))
+                            }
+                        }
+                    } else {
+                        Text("非公開スプレッドシートを安全に同期するにはGoogleアカウントを選択してください", fontSize = 11.sp, color = Color(0xFF94A3B8))
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                val intent = googleAuthHelper.newChooseAccountIntent()
+                                accountPickerLauncher.launch(intent)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                        ) {
+                            Text("Googleアカウントを選択して連携", fontSize = 13.sp)
+                        }
+                    }
                 }
             },
             confirmButton = {
                 Button(onClick = {
-                    onSaveConfig(tempKey, tempModel)
+                    onSaveConfig(tempKey, tempModel, tempUseDecision)
                     showSettingsDialog = false
                     Toast.makeText(context, "設定を保存しました", Toast.LENGTH_SHORT).show()
                 }) {
@@ -418,6 +578,8 @@ fun ResultCardView(card: CardDisplayItem, onOpenUrl: (String) -> Unit) {
     val market = card.market
 
     val borderColor = when {
+        match.canCompleteByBS -> Color(0xFFFBBF24) // 初版帯付きコンプ: ゴールド枠
+        match.canCompleteByB -> Color(0xFFEC4899)  // 重版帯付きコンプ: ピンク/ローズ枠
         match.canCompleteByStore -> Color(0xFF22C55E)
         match.canCompleteByMerged -> Color(0xFF38BDF8)
         else -> Color(0xFF334155)
@@ -435,14 +597,49 @@ fun ResultCardView(card: CardDisplayItem, onOpenUrl: (String) -> Unit) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    match.title,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 16.sp,
-                    color = Color.White,
-                    modifier = Modifier.weight(1f)
-                )
-                if (match.canCompleteByStore) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            match.title,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp,
+                            color = Color.White
+                        )
+                        // 刊行形態（判型）バッジ
+                        match.formatType?.let { format ->
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = Color(0xFF0369A1),
+                                modifier = Modifier.padding(0.dp)
+                            ) {
+                                Text(
+                                    text = format,
+                                    color = Color(0xFFE0F2FE),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+                    if (match.note.isNotBlank()) {
+                        Text(
+                            match.note,
+                            fontSize = 11.sp,
+                            color = Color(0xFF94A3B8)
+                        )
+                    }
+                }
+                
+                // 優先コンプバッジ表示
+                if (match.canCompleteByBS) {
+                    Text("👑 全巻初版帯付き(BS)コンプ!", color = Color(0xFFFBBF24), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                } else if (match.canCompleteByB) {
+                    Text("🎀 全巻帯付き(B重版)コンプ!", color = Color(0xFFEC4899), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                } else if (match.canCompleteByStore) {
                     Text("🎉 店頭で全巻揃う!", color = Color(0xFF22C55E), fontWeight = FontWeight.Bold, fontSize = 12.sp)
                 } else if (match.canCompleteByMerged) {
                     Text("⚡ 在庫合体で全巻コンプ!", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 12.sp)
@@ -461,6 +658,15 @@ fun ResultCardView(card: CardDisplayItem, onOpenUrl: (String) -> Unit) {
             ) {
                 Text("🏪 店頭: ${match.storeVolumes.joinToString(", ") { "${it}巻" }}", fontSize = 12.sp, color = Color(0xFF93C5FD))
                 Text("📦 在庫: ${if (match.stockVolumes.isEmpty()) "なし" else match.stockVolumes.joinToString(", ") { "${it}巻" }}", fontSize = 12.sp, color = Color(0xFF6EE7B7))
+                if (match.storeObiVolumes.isNotEmpty()) {
+                    Text("🎗️ 店頭帯付き: ${match.storeObiVolumes.joinToString(", ") { "${it}巻" }}", fontSize = 11.sp, color = Color(0xFFFDE68A))
+                }
+                if (match.stockBVolumes.isNotEmpty()) {
+                    Text("🎀 在庫帯付き(B): ${match.stockBVolumes.joinToString(", ") { "${it}巻" }}", fontSize = 11.sp, color = Color(0xFFF472B6))
+                }
+                if (match.stockBSVolumes.isNotEmpty()) {
+                    Text("👑 在庫初版帯付き(BS): ${match.stockBSVolumes.joinToString(", ") { "${it}巻" }}", fontSize = 11.sp, color = Color(0xFFFCD34D))
+                }
                 if (match.missingVolumes.isNotEmpty()) {
                     Text("❌ 不足: ${match.missingVolumes.joinToString(", ") { "${it}巻" }}", fontSize = 12.sp, color = Color(0xFFFCA5A5))
                 }
@@ -500,7 +706,7 @@ fun ResultCardView(card: CardDisplayItem, onOpenUrl: (String) -> Unit) {
                 }
                 if (market?.estimatedProfit != null) {
                     Spacer(modifier = Modifier.height(4.dp))
-                    Divider(color = Color(0xFF1E3A8A))
+                    HorizontalDivider(color = Color(0xFF1E3A8A))
                     Spacer(modifier = Modifier.height(4.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -548,7 +754,7 @@ fun ResultCardView(card: CardDisplayItem, onOpenUrl: (String) -> Unit) {
 }
 
 /**
- * 在庫一覧行（4区分コンディションバッジ表示: 無印先頭）
+ * 在庫一覧行（画像通りのコンディション内訳バッジ表示: D 2, B 3, BS 1, ST 1 等）
  */
 @Composable
 fun StockRowView(item: StockItem) {
@@ -575,7 +781,7 @@ fun StockRowView(item: StockItem) {
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    "在庫: ${item.totalCount.coerceAtLeast(item.actualCount)}冊",
+                    "在庫: ${item.totalCount}冊",
                     color = Color(0xFF34D399),
                     fontWeight = FontWeight.Bold,
                     fontSize = 12.sp
@@ -592,41 +798,55 @@ fun StockRowView(item: StockItem) {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // コンディション4区分バッジ（無印先頭）
-            Row(
+            // コンディション記号ごとの冊数バッジ（横スクロール可能）
+            LazyRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                if (item.isUnmarked) {
-                    ConditionBadge(text = "無印", bgColor = Color(0xFF334155), textColor = Color(0xFF94A3B8))
-                }
-                if (item.hasObi) {
-                    ConditionBadge(text = "帯あり", bgColor = Color(0xFF854D0E), textColor = Color(0xFFFEF08A))
-                }
-                if (item.isFirstEdition) {
-                    ConditionBadge(text = "初版", bgColor = Color(0xFF1E3A8A), textColor = Color(0xFF93C5FD))
-                }
-                if (item.isDamaged) {
-                    ConditionBadge(text = "ダメージ品", bgColor = Color(0xFF7F1D1D), textColor = Color(0xFFFCA5A5))
+                // 表示順: D, B, BS, その他
+                val sortedKeys = item.conditionCounts.keys.sortedWith(Comparator { a, b ->
+                    val orderA = when (a) { "D" -> 0; "B" -> 1; "BS" -> 2; else -> 3 }
+                    val orderB = when (b) { "D" -> 0; "B" -> 1; "BS" -> 2; else -> 3 }
+                    if (orderA != orderB) orderA.compareTo(orderB) else a.compareTo(b)
+                })
+
+                items(sortedKeys) { condKey ->
+                    val count = item.conditionCounts[condKey] ?: 0
+                    ConditionCountBadge(conditionKey = condKey, count = count)
                 }
             }
         }
     }
 }
 
+/**
+ * 記号別バッジ（画像通りのカラーリング）
+ * D 2: グレー/スレート系
+ * B 3: ゴールド/黄褐色系
+ * BS 1: ブルー/濃紺系
+ * ST 1: ワインレッド/パープル系
+ */
 @Composable
-fun ConditionBadge(text: String, bgColor: Color, textColor: Color) {
+fun ConditionCountBadge(conditionKey: String, count: Int) {
+    val (bgColor, textColor) = when (conditionKey) {
+        "D" -> Pair(Color(0xFF334155), Color(0xFFCBD5E1))
+        "B" -> Pair(Color(0xFF854D0E), Color(0xFFFEF08A))
+        "BS" -> Pair(Color(0xFF1E3A8A), Color(0xFF93C5FD))
+        "ST", "S" -> Pair(Color(0xFF831843), Color(0xFFFBCFE8))
+        else -> Pair(Color(0xFF374151), Color(0xFFE5E7EB))
+    }
+
     Surface(
         shape = RoundedCornerShape(4.dp),
         color = bgColor,
         modifier = Modifier.padding(0.dp)
     ) {
         Text(
-            text = text,
+            text = "$conditionKey $count",
             color = textColor,
-            fontSize = 10.sp,
+            fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
         )
     }
 }
